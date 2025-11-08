@@ -55,6 +55,11 @@ var psm_yaw_integral: float = 0.0
 # Deadzone for detecting player override
 @export var psm_stick_deadzone: float = 0.05  # 5% deadzone - inside = hold, outside = override
 
+# Attitude hold tolerance (natural variance)
+@export_group("PSM Stability vs Responsiveness")
+@export var psm_hold_tolerance_degrees: float = 2.0  ## Tolerance before corrections applied (degrees) - higher = more drift/variance
+@export var psm_stability_mode: String = "balanced"  ## "tight" (minimal drift), "balanced" (some drift), "loose" (natural feel)
+
 # PID Gains for Attitude Hold
 @export_group("PSM Attitude Hold - Pitch")
 @export var psm_pitch_kp: float = 2.0    # Proportional gain
@@ -504,6 +509,9 @@ func calculate_psm_attitude_assistance(raw_inputs: Dictionary, aircraft_state: D
 	# Delta time (assume 120Hz physics)
 	var dt = 1.0 / 120.0
 
+	# Get tolerance based on stability mode
+	var tolerance_rad = get_hold_tolerance()
+
 	# === PITCH AXIS ===
 	var pitch_assist = 0.0
 	var pitch_tv_request = 0.0
@@ -515,20 +523,27 @@ func calculate_psm_attitude_assistance(raw_inputs: Dictionary, aircraft_state: D
 		# Update reference continuously while player commands
 		psm_reference_attitude = current_attitude
 	else:
-		# HOLD MODE - Lock pitch attitude
-		# PID controller: P + I + D
-		var P = pitch_error * psm_pitch_kp
-		psm_pitch_integral += pitch_error * dt
-		psm_pitch_integral = clamp(psm_pitch_integral, -10.0, 10.0)  # Anti-windup
-		var I = psm_pitch_integral * psm_pitch_ki
-		var D = -pitch_rate * psm_pitch_kd  # Damping (opposes rotation)
+		# HOLD MODE - Lock pitch attitude (with tolerance deadband)
+		if abs(pitch_error) > tolerance_rad:
+			# Outside tolerance - apply PID correction
+			# Use (error - tolerance) to create smooth transition
+			var error_beyond_tolerance = sign(pitch_error) * (abs(pitch_error) - tolerance_rad)
+			var P = error_beyond_tolerance * psm_pitch_kp
+			psm_pitch_integral += error_beyond_tolerance * dt
+			psm_pitch_integral = clamp(psm_pitch_integral, -10.0, 10.0)  # Anti-windup
+			var I = psm_pitch_integral * psm_pitch_ki
+			var D = -pitch_rate * psm_pitch_kd  # Damping (opposes rotation)
 
-		pitch_assist = P + I + D
-		pitch_assist = clamp(pitch_assist, -5.0, 5.0)
+			pitch_assist = P + I + D
+			pitch_assist = clamp(pitch_assist, -5.0, 5.0)
 
-		# Request thrust vectoring if needed (large error or saturated control)
-		if abs(pitch_error) > deg_to_rad(10.0) or abs(pitch_assist) > 4.0:
-			pitch_tv_request = P * psm_pitch_ktv
+			# Request thrust vectoring if needed (large error or saturated control)
+			if abs(pitch_error) > deg_to_rad(10.0) or abs(pitch_assist) > 4.0:
+				pitch_tv_request = P * psm_pitch_ktv
+		else:
+			# Inside tolerance - allow natural drift, only dampen rotation
+			pitch_assist = -pitch_rate * psm_pitch_kd * 0.3  # Light damping only
+			psm_pitch_integral = 0.0  # Reset integral when in deadband
 
 	# === ROLL AXIS ===
 	var roll_assist = 0.0
@@ -540,18 +555,25 @@ func calculate_psm_attitude_assistance(raw_inputs: Dictionary, aircraft_state: D
 		psm_roll_integral = 0.0
 		psm_reference_attitude = current_attitude
 	else:
-		# HOLD MODE - Lock roll attitude
-		var P = roll_error * psm_roll_kp
-		psm_roll_integral += roll_error * dt
-		psm_roll_integral = clamp(psm_roll_integral, -10.0, 10.0)
-		var I = psm_roll_integral * psm_roll_ki
-		var D = -roll_rate * psm_roll_kd
+		# HOLD MODE - Lock roll attitude (with tolerance deadband)
+		if abs(roll_error) > tolerance_rad:
+			# Outside tolerance - apply PID correction
+			var error_beyond_tolerance = sign(roll_error) * (abs(roll_error) - tolerance_rad)
+			var P = error_beyond_tolerance * psm_roll_kp
+			psm_roll_integral += error_beyond_tolerance * dt
+			psm_roll_integral = clamp(psm_roll_integral, -10.0, 10.0)
+			var I = psm_roll_integral * psm_roll_ki
+			var D = -roll_rate * psm_roll_kd
 
-		roll_assist = P + I + D
-		roll_assist = clamp(roll_assist, -5.0, 5.0)
+			roll_assist = P + I + D
+			roll_assist = clamp(roll_assist, -5.0, 5.0)
 
-		if abs(roll_error) > deg_to_rad(10.0) or abs(roll_assist) > 4.0:
-			roll_tv_request = P * psm_roll_ktv
+			if abs(roll_error) > deg_to_rad(10.0) or abs(roll_assist) > 4.0:
+				roll_tv_request = P * psm_roll_ktv
+		else:
+			# Inside tolerance - allow natural drift, only dampen rotation
+			roll_assist = -roll_rate * psm_roll_kd * 0.3
+			psm_roll_integral = 0.0
 
 	# === YAW AXIS ===
 	var yaw_assist = 0.0
@@ -563,25 +585,32 @@ func calculate_psm_attitude_assistance(raw_inputs: Dictionary, aircraft_state: D
 		psm_yaw_integral = 0.0
 		psm_reference_attitude = current_attitude
 	else:
-		# HOLD MODE - Lock yaw attitude
-		var P = yaw_error * psm_yaw_kp
-		psm_yaw_integral += yaw_error * dt
-		psm_yaw_integral = clamp(psm_yaw_integral, -10.0, 10.0)
-		var I = psm_yaw_integral * psm_yaw_ki
-		var D = -yaw_rate * psm_yaw_kd
+		# HOLD MODE - Lock yaw attitude (with tolerance deadband)
+		if abs(yaw_error) > tolerance_rad:
+			# Outside tolerance - apply PID correction
+			var error_beyond_tolerance = sign(yaw_error) * (abs(yaw_error) - tolerance_rad)
+			var P = error_beyond_tolerance * psm_yaw_kp
+			psm_yaw_integral += error_beyond_tolerance * dt
+			psm_yaw_integral = clamp(psm_yaw_integral, -10.0, 10.0)
+			var I = psm_yaw_integral * psm_yaw_ki
+			var D = -yaw_rate * psm_yaw_kd
 
-		yaw_assist = P + I + D
-		yaw_assist = clamp(yaw_assist, -5.0, 5.0)
+			yaw_assist = P + I + D
+			yaw_assist = clamp(yaw_assist, -5.0, 5.0)
 
-		if abs(yaw_error) > deg_to_rad(10.0) or abs(yaw_assist) > 4.0:
-			yaw_tv_request = P * psm_yaw_ktv
+			if abs(yaw_error) > deg_to_rad(10.0) or abs(yaw_assist) > 4.0:
+				yaw_tv_request = P * psm_yaw_ktv
+		else:
+			# Inside tolerance - allow natural drift, only dampen rotation
+			yaw_assist = -yaw_rate * psm_yaw_kd * 0.3
+			psm_yaw_integral = 0.0
 
 	# Debug output
 	if Engine.get_physics_frames() % 60 == 0:
-		var pitch_mode = "OVERRIDE" if abs(pitch_input) > psm_stick_deadzone else "HOLD"
-		var roll_mode = "OVERRIDE" if abs(roll_input) > psm_stick_deadzone else "HOLD"
-		var yaw_mode = "OVERRIDE" if abs(yaw_input) > psm_stick_deadzone else "HOLD"
-		print("[PSM ATTITUDE HOLD]")
+		var pitch_mode = "OVERRIDE" if abs(pitch_input) > psm_stick_deadzone else ("DRIFT" if abs(pitch_error) <= tolerance_rad else "HOLD")
+		var roll_mode = "OVERRIDE" if abs(roll_input) > psm_stick_deadzone else ("DRIFT" if abs(roll_error) <= tolerance_rad else "HOLD")
+		var yaw_mode = "OVERRIDE" if abs(yaw_input) > psm_stick_deadzone else ("DRIFT" if abs(yaw_error) <= tolerance_rad else "HOLD")
+		print("[PSM ATTITUDE HOLD - %s mode, tolerance: %.1f°]" % [psm_stability_mode, rad_to_deg(tolerance_rad)])
 		print("  Pitch: %s | Error: %.1f° | Assist: %.2f" % [pitch_mode, rad_to_deg(pitch_error), pitch_assist])
 		print("  Roll:  %s | Error: %.1f° | Assist: %.2f" % [roll_mode, rad_to_deg(roll_error), roll_assist])
 		print("  Yaw:   %s | Error: %.1f° | Assist: %.2f" % [yaw_mode, rad_to_deg(yaw_error), yaw_assist])
@@ -621,6 +650,24 @@ func wrap_angle(angle: float) -> float:
 	while angle < -PI:
 		angle += TAU
 	return angle
+
+func get_hold_tolerance() -> float:
+	## Get tolerance based on stability mode
+	## Returns tolerance in radians
+
+	# Apply mode-based multiplier
+	var tolerance_multiplier = 1.0
+	match psm_stability_mode:
+		"tight":
+			tolerance_multiplier = 0.5  # Half the configured tolerance (tighter hold)
+		"balanced":
+			tolerance_multiplier = 1.0  # Use configured tolerance as-is
+		"loose":
+			tolerance_multiplier = 2.0  # Double the tolerance (more drift)
+		_:
+			tolerance_multiplier = 1.0  # Default to balanced
+
+	return deg_to_rad(psm_hold_tolerance_degrees) * tolerance_multiplier
 
 func reset_psm_state():
 	## Call when exiting PSM mode to reset state

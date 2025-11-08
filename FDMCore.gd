@@ -111,7 +111,7 @@ var inertia_tensor: Basis = Basis()  # Calculated from Ixx, Iyy, Izz, Ixz
 @export var psm_max_roll_rate: float = 10.0 ## Maximum desired roll rate in PSM mode (rad/s)
 @export var psm_max_yaw_rate: float = 6.0 ## Maximum desired yaw rate in PSM mode (rad/s)
 @export var psm_aerodynamic_coupling_factor: float = 0.15 ## How much control surfaces fight aerodynamic coupling (0.0-1.0)
-@export var psm_aerodynamic_effect_multiplier: float = 0.05 ## Scale of aerodynamic effects in PSM mode (0.0=none, 1.0=full) - reduces natural yaw/pitch coupling
+@export var psm_aerodynamic_effect_multiplier: float = 0.15 ## Scale of aerodynamic effects in PSM mode (0.0=none, 1.0=full) - reduces natural yaw/pitch coupling
 @export var psm_form_drag_multiplier: float = 2.0 ## Additional drag when top/bottom/sides face velocity in PSM (0-10)
 @export var psm_direct_control_mode: bool = true ## PSM uses direct rate control (spaceship-like) instead of attitude hold
 @export var psm_rate_authority: float = 8.0 ## How strongly PSM controls rotation rates (0-20)
