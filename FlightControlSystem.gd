@@ -40,7 +40,42 @@ var cobra_override: bool = false
 # Airbrake
 var airbrake_extended: bool = false
 
-# PSM Perfect Decoupled Control - no state needed, purely input-driven
+# === PSM Attitude Hold System ===
+# "Point and Lock" - Player points plane, assistance locks it there
+
+# Reference attitude (captured when PSM entered or when player releases stick)
+var psm_reference_attitude: Quaternion = Quaternion.IDENTITY
+var psm_initialized: bool = false
+
+# PID controller state (one per axis: pitch, roll, yaw)
+var psm_pitch_integral: float = 0.0
+var psm_roll_integral: float = 0.0
+var psm_yaw_integral: float = 0.0
+
+# Deadzone for detecting player override
+@export var psm_stick_deadzone: float = 0.05  # 5% deadzone - inside = hold, outside = override
+
+# PID Gains for Attitude Hold
+@export_group("PSM Attitude Hold - Pitch")
+@export var psm_pitch_kp: float = 2.0    # Proportional gain
+@export var psm_pitch_ki: float = 0.1    # Integral gain (fights persistent forces)
+@export var psm_pitch_kd: float = 0.5    # Derivative gain (damping)
+@export var psm_pitch_ktv: float = 1.5   # Thrust vectoring multiplier
+
+@export_group("PSM Attitude Hold - Roll")
+@export var psm_roll_kp: float = 2.5     # Stronger for quick roll response
+@export var psm_roll_ki: float = 0.15
+@export var psm_roll_kd: float = 0.4
+@export var psm_roll_ktv: float = 1.2
+
+@export_group("PSM Attitude Hold - Yaw")
+@export var psm_yaw_kp: float = 1.8      # Weaker (yaw naturally slower)
+@export var psm_yaw_ki: float = 0.08
+@export var psm_yaw_kd: float = 0.6
+@export var psm_yaw_ktv: float = 1.8     # Stronger TV for yaw
+
+# Track previous PSM state to detect mode transitions
+var previous_psm_mode: bool = false
 
 func process_control_inputs(raw_inputs: Dictionary, aircraft_state: Dictionary) -> Dictionary:
 	var processed_inputs = {}
@@ -50,6 +85,15 @@ func process_control_inputs(raw_inputs: Dictionary, aircraft_state: Dictionary) 
 
 	# Get PSM mode early (needed for multiple checks)
 	var psm_mode = raw_inputs.get("psm_mode", false)
+
+	# Detect PSM mode transition (entering or exiting)
+	if psm_mode != previous_psm_mode:
+		if psm_mode:
+			print("[PSM] Entering PSM mode - Attitude Hold Active")
+		else:
+			print("[PSM] Exiting PSM mode - Attitude Hold Deactivated")
+			reset_psm_state()
+		previous_psm_mode = psm_mode
 
 	# Calculate speed-based control scaling (fly-by-wire gain scheduling)
 	var pitch_scale = 1.0
@@ -174,15 +218,31 @@ func process_control_inputs(raw_inputs: Dictionary, aircraft_state: Dictionary) 
 	# PSM assistance is applied through control surface inputs
 	# No direct angular velocity override - aerodynamics fully drive the plane
 
-	# Thrust vectoring commands (coupled to flight controls)
+	# Thrust vectoring commands (coupled to flight controls + PSM assistance)
+	var tv_pitch = 0.0
+	var tv_yaw = 0.0
+	var tv_active = false
+
+	# Manual thrust vectoring from player
 	if raw_inputs.get("thrust_vector_active", false):
-		processed_inputs["vector_pitch"] = calculate_thrust_vector_pitch(raw_inputs, aircraft_state)
-		processed_inputs["vector_yaw"] = calculate_thrust_vector_yaw(raw_inputs, aircraft_state)
-		processed_inputs["thrust_vector_active"] = true
-	else:
-		processed_inputs["vector_pitch"] = 0.0
-		processed_inputs["vector_yaw"] = 0.0
-		processed_inputs["thrust_vector_active"] = false
+		tv_pitch = calculate_thrust_vector_pitch(raw_inputs, aircraft_state)
+		tv_yaw = calculate_thrust_vector_yaw(raw_inputs, aircraft_state)
+		tv_active = true
+
+	# PSM attitude hold thrust vectoring (adds to manual if both active)
+	if psm_assistance and psm_assistance.has("thrust_vector_pitch"):
+		tv_pitch += psm_assistance.get("thrust_vector_pitch", 0.0)
+		tv_yaw += psm_assistance.get("thrust_vector_yaw", 0.0)
+		if abs(tv_pitch) > 0.01 or abs(tv_yaw) > 0.01:
+			tv_active = true  # PSM can activate TV even without manual command
+
+	# Clamp thrust vectoring to reasonable limits
+	tv_pitch = clamp(tv_pitch, -5.0, 5.0)
+	tv_yaw = clamp(tv_yaw, -5.0, 5.0)
+
+	processed_inputs["vector_pitch"] = tv_pitch
+	processed_inputs["vector_yaw"] = tv_yaw
+	processed_inputs["thrust_vector_active"] = tv_active
 
 	return processed_inputs
 
@@ -401,64 +461,173 @@ func calculate_thrust_vector_yaw(inputs: Dictionary, _state: Dictionary) -> floa
 	return inputs.get("yaw", 0.0) * 0.8
 
 func calculate_psm_attitude_assistance(raw_inputs: Dictionary, aircraft_state: Dictionary) -> Dictionary:
-	## PSM Direct Rate Control System
-	## Player input directly commands rotation rates (like a spaceship)
-	## System fights aerodynamic disturbances to maintain commanded rate
+	## PSM Attitude Hold System - "Point and Lock"
+	## Player points plane where they want, assistance locks it there
+	## When stick is centered = HOLD attitude. When stick moved = OVERRIDE and update reference.
 
-	# Get player inputs (these directly command rotation rates)
+	# Get aircraft transform for attitude calculations
+	var aircraft_transform = aircraft_state.get("transform", Transform3D.IDENTITY)
+	if aircraft_transform == Transform3D.IDENTITY and aircraft_state.has("position"):
+		# Build transform from position and basis if available
+		var fdm = get_parent()  # Assume FCS is child of FDMCore
+		if fdm and fdm is RigidBody3D:
+			aircraft_transform = fdm.global_transform
+
+	var current_attitude = aircraft_transform.basis.get_rotation_quaternion()
+
+	# Initialize reference on first PSM frame
+	if not psm_initialized:
+		psm_reference_attitude = current_attitude
+		psm_pitch_integral = 0.0
+		psm_roll_integral = 0.0
+		psm_yaw_integral = 0.0
+		psm_initialized = true
+		print("[PSM] Attitude hold initialized - reference captured")
+
+	# Get player inputs
 	var pitch_input = raw_inputs.get("pitch", 0.0)
 	var roll_input = raw_inputs.get("roll", 0.0)
 	var yaw_input = raw_inputs.get("yaw", 0.0)
 
-	# Get PSM rate limits (max rotation rates for each axis)
-	var psm_max_pitch_rate = aircraft_state.get("psm_max_pitch_rate", 8.0)
-	var psm_max_roll_rate = aircraft_state.get("psm_max_roll_rate", 10.0)
-	var psm_max_yaw_rate = aircraft_state.get("psm_max_yaw_rate", 6.0)
-
-	# Get current rotation rates from aircraft
+	# Get current angular velocity (for derivative term)
 	var angular_vel = aircraft_state.get("angular_velocity", Vector3.ZERO)
-	var current_pitch_rate = angular_vel.y  # q: pitch rate (around Y axis in JSBSim)
-	var current_roll_rate = angular_vel.x   # p: roll rate (around X axis)
-	var current_yaw_rate = angular_vel.z    # r: yaw rate (around Z axis)
+	var pitch_rate = angular_vel.y  # JSBSim frame: Y = pitch
+	var roll_rate = angular_vel.x   # JSBSim frame: X = roll
+	var yaw_rate = angular_vel.z    # JSBSim frame: Z = yaw
 
-	# Calculate desired rotation rates from player input
-	var desired_pitch_rate = pitch_input * psm_max_pitch_rate
-	var desired_roll_rate = roll_input * psm_max_roll_rate
-	var desired_yaw_rate = yaw_input * psm_max_yaw_rate
+	# Calculate attitude errors (reference - current) in Euler angles
+	var error_angles = calculate_attitude_error(psm_reference_attitude, current_attitude)
+	var pitch_error = error_angles.x
+	var roll_error = error_angles.y
+	var yaw_error = error_angles.z
 
-	# Calculate rate errors (desired - actual)
-	var pitch_rate_error = desired_pitch_rate - current_pitch_rate
-	var roll_rate_error = desired_roll_rate - current_roll_rate
-	var yaw_rate_error = desired_yaw_rate - current_yaw_rate
+	# Delta time (assume 120Hz physics)
+	var dt = 1.0 / 120.0
 
-	# Get PSM control authority (how strongly we fight to achieve desired rate)
-	var rate_authority = aircraft_state.get("psm_rate_authority", 8.0)
+	# === PITCH AXIS ===
+	var pitch_assist = 0.0
+	var pitch_tv_request = 0.0
 
-	# Generate strong control corrections to achieve desired rates
-	# This is proportional control on rate error - larger error = stronger correction
-	var pitch_assist = pitch_rate_error * rate_authority * 0.2
-	var roll_assist = roll_rate_error * rate_authority * 0.2
-	var yaw_assist = yaw_rate_error * rate_authority * 0.2
+	if abs(pitch_input) > psm_stick_deadzone:
+		# OVERRIDE MODE - Player is pitching
+		pitch_assist = 0.0  # Let player command directly (no assistance interference)
+		psm_pitch_integral = 0.0  # Reset integral
+		# Update reference continuously while player commands
+		psm_reference_attitude = current_attitude
+	else:
+		# HOLD MODE - Lock pitch attitude
+		# PID controller: P + I + D
+		var P = pitch_error * psm_pitch_kp
+		psm_pitch_integral += pitch_error * dt
+		psm_pitch_integral = clamp(psm_pitch_integral, -10.0, 10.0)  # Anti-windup
+		var I = psm_pitch_integral * psm_pitch_ki
+		var D = -pitch_rate * psm_pitch_kd  # Damping (opposes rotation)
 
-	# Clamp outputs to maximum control deflection
-	pitch_assist = clamp(pitch_assist, -5.0, 5.0)  # Allow stronger than normal control
-	roll_assist = clamp(roll_assist, -5.0, 5.0)
-	yaw_assist = clamp(yaw_assist, -5.0, 5.0)
+		pitch_assist = P + I + D
+		pitch_assist = clamp(pitch_assist, -5.0, 5.0)
+
+		# Request thrust vectoring if needed (large error or saturated control)
+		if abs(pitch_error) > deg_to_rad(10.0) or abs(pitch_assist) > 4.0:
+			pitch_tv_request = P * psm_pitch_ktv
+
+	# === ROLL AXIS ===
+	var roll_assist = 0.0
+	var roll_tv_request = 0.0
+
+	if abs(roll_input) > psm_stick_deadzone:
+		# OVERRIDE MODE - Player is rolling
+		roll_assist = 0.0
+		psm_roll_integral = 0.0
+		psm_reference_attitude = current_attitude
+	else:
+		# HOLD MODE - Lock roll attitude
+		var P = roll_error * psm_roll_kp
+		psm_roll_integral += roll_error * dt
+		psm_roll_integral = clamp(psm_roll_integral, -10.0, 10.0)
+		var I = psm_roll_integral * psm_roll_ki
+		var D = -roll_rate * psm_roll_kd
+
+		roll_assist = P + I + D
+		roll_assist = clamp(roll_assist, -5.0, 5.0)
+
+		if abs(roll_error) > deg_to_rad(10.0) or abs(roll_assist) > 4.0:
+			roll_tv_request = P * psm_roll_ktv
+
+	# === YAW AXIS ===
+	var yaw_assist = 0.0
+	var yaw_tv_request = 0.0
+
+	if abs(yaw_input) > psm_stick_deadzone:
+		# OVERRIDE MODE - Player is yawing
+		yaw_assist = 0.0
+		psm_yaw_integral = 0.0
+		psm_reference_attitude = current_attitude
+	else:
+		# HOLD MODE - Lock yaw attitude
+		var P = yaw_error * psm_yaw_kp
+		psm_yaw_integral += yaw_error * dt
+		psm_yaw_integral = clamp(psm_yaw_integral, -10.0, 10.0)
+		var I = psm_yaw_integral * psm_yaw_ki
+		var D = -yaw_rate * psm_yaw_kd
+
+		yaw_assist = P + I + D
+		yaw_assist = clamp(yaw_assist, -5.0, 5.0)
+
+		if abs(yaw_error) > deg_to_rad(10.0) or abs(yaw_assist) > 4.0:
+			yaw_tv_request = P * psm_yaw_ktv
 
 	# Debug output
 	if Engine.get_physics_frames() % 60 == 0:
-		print("PSM RATE CONTROL: P_err=%.1f°/s (assist=%.2f), R_err=%.1f°/s (assist=%.2f), Y_err=%.1f°/s (assist=%.2f)" % [
-			rad_to_deg(pitch_rate_error), pitch_assist,
-			rad_to_deg(roll_rate_error), roll_assist,
-			rad_to_deg(yaw_rate_error), yaw_assist
-		])
+		var pitch_mode = "OVERRIDE" if abs(pitch_input) > psm_stick_deadzone else "HOLD"
+		var roll_mode = "OVERRIDE" if abs(roll_input) > psm_stick_deadzone else "HOLD"
+		var yaw_mode = "OVERRIDE" if abs(yaw_input) > psm_stick_deadzone else "HOLD"
+		print("[PSM ATTITUDE HOLD]")
+		print("  Pitch: %s | Error: %.1f° | Assist: %.2f" % [pitch_mode, rad_to_deg(pitch_error), pitch_assist])
+		print("  Roll:  %s | Error: %.1f° | Assist: %.2f" % [roll_mode, rad_to_deg(roll_error), roll_assist])
+		print("  Yaw:   %s | Error: %.1f° | Assist: %.2f" % [yaw_mode, rad_to_deg(yaw_error), yaw_assist])
 
-	# Return control surface deflections to achieve desired rates
+	# Return control surface deflections + thrust vectoring requests
 	return {
 		"pitch": pitch_assist,
 		"roll": roll_assist,
-		"yaw": yaw_assist
+		"yaw": yaw_assist,
+		"thrust_vector_pitch": pitch_tv_request,
+		"thrust_vector_yaw": yaw_tv_request
 	}
+
+func calculate_attitude_error(reference_quat: Quaternion, current_quat: Quaternion) -> Vector3:
+	## Calculate attitude error in Euler angles (pitch, roll, yaw)
+	## Returns Vector3(pitch_error, roll_error, yaw_error) in radians
+
+	# Calculate error quaternion: q_error = q_reference * q_current^-1
+	var error_quat = reference_quat * current_quat.inverse()
+
+	# Convert error quaternion to Euler angles (using Godot's convention)
+	var error_euler = error_quat.get_euler()
+
+	# Wrap angles to [-PI, PI] for shortest path
+	error_euler.x = wrap_angle(error_euler.x)
+	error_euler.y = wrap_angle(error_euler.y)
+	error_euler.z = wrap_angle(error_euler.z)
+
+	# Return as (pitch, roll, yaw) in JSBSim convention
+	# Godot Euler: (X=pitch, Y=yaw, Z=roll) → JSBSim: (pitch, roll, yaw)
+	return Vector3(error_euler.x, error_euler.z, error_euler.y)
+
+func wrap_angle(angle: float) -> float:
+	## Wrap angle to [-PI, PI] range for shortest path
+	while angle > PI:
+		angle -= TAU
+	while angle < -PI:
+		angle += TAU
+	return angle
+
+func reset_psm_state():
+	## Call when exiting PSM mode to reset state
+	psm_initialized = false
+	psm_pitch_integral = 0.0
+	psm_roll_integral = 0.0
+	psm_yaw_integral = 0.0
 
 func get_control_state() -> Dictionary:
 	return {

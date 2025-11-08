@@ -700,6 +700,7 @@ func get_aircraft_state() -> Dictionary:
 		"position": global_position,
 		"velocity": linear_velocity,
 		"angular_velocity": angular_velocity_body,
+		"transform": global_transform,  # For PSM attitude hold system
 		"altitude": altitude_msl,
 		"airspeed": airspeed,
 		"alpha": angle_of_attack,
