@@ -605,13 +605,17 @@ func detect_combat_thrust_vectoring(processed_controls: Dictionary, raw_inputs: 
 	return is_active
 
 func accumulate_landing_gear_forces(controls: Dictionary, dt: float):
+	## Accumulate forces and moments from landing gear
+	## JSBSim-based model: no position correction, just forces
+
 	# Pass terrain generator to landing gear so each gear can query its own position
 	var gear_result = landing_gear.calculate_gear_forces(
 		global_position, linear_velocity, angular_velocity,
 		global_basis, terrain, controls, dt
 	)
 
-	var gear_force_body = global_basis.inverse() * gear_result["force"]
+	# Convert gear force from world frame to body frame
+	var gear_force_body = godot_to_jsbsim_vector(global_basis.inverse() * gear_result["force"])
 	total_force_body += gear_force_body
 	total_moment_body += gear_result["moment"]
 
@@ -652,19 +656,24 @@ func accumulate_landing_gear_forces(controls: Dictionary, dt: float):
 		# Fuselage is scraping ground or hitting mountain!
 		var penetration = terrain_height_at_center - fuselage_bottom_y
 
-		# Much weaker spring force with damping to prevent bounce
-		var spring_force = penetration * 100000.0  # Reduced from 500000
-		var damping_force = -linear_velocity.y * 30000.0  # Add damping based on vertical velocity
-		var total_normal_force = spring_force + damping_force
+		# JSBSim-style spring-damper for fuselage contact
+		# Softer than landing gear to allow some "give"
+		var spring_force = penetration * 80000.0  # Soft spring
+		var damping_force = -linear_velocity.y * 20000.0  # Moderate damping
+		var total_normal_force = max(0.0, spring_force + damping_force)
 		var fuselage_collision_force = Vector3(0, total_normal_force, 0)
-		total_force_body += global_basis.inverse() * fuselage_collision_force
 
-		# Apply heavy drag when scraping
+		# Convert to body frame and add
+		var fuselage_force_body = godot_to_jsbsim_vector(global_basis.inverse() * fuselage_collision_force)
+		total_force_body += fuselage_force_body
+
+		# Apply drag when scraping (friction with ground)
 		var horizontal_vel = Vector3(linear_velocity.x, 0, linear_velocity.z)
-		var scrape_drag = -horizontal_vel * 10000.0  # Increased friction to slow down
-		total_force_body += global_basis.inverse() * scrape_drag
+		var scrape_drag = -horizontal_vel * 8000.0  # Friction to slow down
+		var drag_force_body = godot_to_jsbsim_vector(global_basis.inverse() * scrape_drag)
+		total_force_body += drag_force_body
 
-		# Debug output - ALWAYS show when fuselage hits
+		# Debug output - show when fuselage hits
 		if landing_gear and landing_gear.debug_landing_gear:
 			var hit_object_name = "Unknown"
 			if result and result.collider:
@@ -676,19 +685,6 @@ func accumulate_landing_gear_forces(controls: Dictionary, dt: float):
 			print("  Spring force: %.0f N | Damping: %.0f N | Total: %.0f N" % [spring_force, damping_force, total_normal_force])
 			print("  Vertical velocity: %.2f m/s" % linear_velocity.y)
 			print("  Horizontal velocity: %.2f m/s" % horizontal_vel.length())
-
-	# Apply position correction to prevent penetration
-	var pos_correction = gear_result.get("position_correction", Vector3.ZERO)
-	if pos_correction.length() > 0.001:
-		if landing_gear.debug_landing_gear:
-			print("FDM: Penetrating ground! Correction: %s, Velocity: %.2f m/s" % [pos_correction, linear_velocity.y])
-
-		# Only apply minimal position correction - let spring forces handle the rest
-		global_position += pos_correction * 0.1  # Only 10% correction
-
-		# Clamp downward velocity to prevent extreme penetration
-		if linear_velocity.y < -5.0:
-			linear_velocity.y = -5.0  # Limit downward speed when penetrating
 
 func get_aircraft_state() -> Dictionary:
 	# Calculate bank angle (roll) relative to horizon
