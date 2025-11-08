@@ -161,11 +161,9 @@ func update_chase_camera(delta: float) -> void:
 		# Set position (fixed, no smoothing to avoid jitter)
 		global_position = target_pos
 
-		# Apply smoothed rotation
-		global_transform.basis = camera_basis
-
-		# Look at aircraft to point camera forward
-		look_at(aircraft_position, Vector3.UP)
+		# Look at aircraft using the smoothed up vector (preserves roll)
+		# Using camera_basis.y instead of Vector3.UP prevents horizon-lock
+		look_at(aircraft_position, camera_basis.y)
 
 func update_cockpit_camera(_delta: float) -> void:
 	## First-person cockpit view with mouse look control

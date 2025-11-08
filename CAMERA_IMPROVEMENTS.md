@@ -26,6 +26,24 @@
 
 **Solution:** Removed and replaced with properly-implemented `chase_rotation_smoothing`
 
+### 4. **Camera Rotation Override Bug (CRITICAL FIX)**
+**Problem:** After implementing quaternion slerp rotation following, camera still appeared horizon-locked. The `look_at()` call was overriding the carefully calculated rotation with horizon-aligned orientation.
+
+**Solution:** Use aircraft's up vector in look_at() to preserve roll:
+- Changed from `look_at(aircraft_position, Vector3.UP)` (world up = horizon lock)
+- To `look_at(aircraft_position, camera_basis.y)` (smoothed aircraft up = preserves roll)
+- Camera now banks and rotates with aircraft while still pointing at it
+- File: `camera_controller.gd:166`
+
+**Technical Detail:**
+```gdscript
+# WRONG - This forces horizon alignment:
+look_at(aircraft_position, Vector3.UP)  # World UP = horizon-locked
+
+# CORRECT - This preserves aircraft roll:
+look_at(aircraft_position, camera_basis.y)  # Aircraft's smoothed UP = follows roll
+```
+
 ---
 
 ## Implementation Details
