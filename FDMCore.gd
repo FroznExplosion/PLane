@@ -104,17 +104,12 @@ var inertia_tensor: Basis = Basis()  # Calculated from Ixx, Iyy, Izz, Ixz
 @export var airbrake_deflection_max: float = 60.0 ## Maximum airbrake opening angle
 @export var thrust_vector_max: float = 20.0 ## Maximum thrust vectoring angle
 
-# PSM Attitude Assistance (Coupling Resistance)
+# PSM Attitude Assistance
 @export_group("PSM Attitude Assistance")
-@export var psm_attitude_assistance_enabled: bool = true ## Enable coupling resistance assistance
-@export var psm_max_pitch_rate: float = 8.0 ## Maximum desired pitch rate in PSM mode (rad/s)
-@export var psm_max_roll_rate: float = 10.0 ## Maximum desired roll rate in PSM mode (rad/s)
-@export var psm_max_yaw_rate: float = 6.0 ## Maximum desired yaw rate in PSM mode (rad/s)
+@export var psm_attitude_assistance_enabled: bool = true ## Enable PSM attitude hold assistance
 @export var psm_aerodynamic_coupling_factor: float = 0.15 ## How much control surfaces fight aerodynamic coupling (0.0-1.0)
-@export var psm_aerodynamic_effect_multiplier: float = 0.05 ## Scale of aerodynamic effects in PSM mode (0.0=none, 1.0=full) - reduces natural yaw/pitch coupling
+@export var psm_aerodynamic_effect_multiplier: float = 0.15 ## Scale of aerodynamic effects in PSM mode (0.0=none, 1.0=full) - allows natural drift
 @export var psm_form_drag_multiplier: float = 2.0 ## Additional drag when top/bottom/sides face velocity in PSM (0-10)
-@export var psm_direct_control_mode: bool = true ## PSM uses direct rate control (spaceship-like) instead of attitude hold
-@export var psm_rate_authority: float = 8.0 ## How strongly PSM controls rotation rates (0-20)
 
 # Rotation Rate Limits
 @export_group("Rotation Rate Limits")
@@ -360,9 +355,12 @@ func integrate_equations_of_motion_with_state(state: PhysicsDirectBodyState3D, d
 	angular_velocity_body += angular_acceleration * dt
 
 	# Apply hard rotation rate limits per axis
-	# JSBSim body frame: X=forward (pitch), Y=right (roll), Z=down (yaw)
-	angular_velocity_body.x = clamp(angular_velocity_body.x, -max_pitch_rate_limit, max_pitch_rate_limit)
-	angular_velocity_body.y = clamp(angular_velocity_body.y, -max_roll_rate_limit, max_roll_rate_limit)
+	# JSBSim body frame angular velocity: (p, q, r) = (roll, pitch, yaw)
+	# X = p (roll rate around forward axis)
+	# Y = q (pitch rate around right axis)
+	# Z = r (yaw rate around down axis)
+	angular_velocity_body.x = clamp(angular_velocity_body.x, -max_roll_rate_limit, max_roll_rate_limit)
+	angular_velocity_body.y = clamp(angular_velocity_body.y, -max_pitch_rate_limit, max_pitch_rate_limit)
 	angular_velocity_body.z = clamp(angular_velocity_body.z, -max_yaw_rate_limit, max_yaw_rate_limit)
 
 	# PSM MODE: Full aerodynamic effects with coupling resistance
@@ -700,6 +698,7 @@ func get_aircraft_state() -> Dictionary:
 		"position": global_position,
 		"velocity": linear_velocity,
 		"angular_velocity": angular_velocity_body,
+		"transform": global_transform,  # For PSM attitude hold system
 		"altitude": altitude_msl,
 		"airspeed": airspeed,
 		"alpha": angle_of_attack,
@@ -721,12 +720,7 @@ func get_aircraft_state() -> Dictionary:
 		"sideslip_correction_weight": sideslip_correction_weight,
 		# PSM Attitude Assistance parameters
 		"psm_attitude_assistance_enabled": psm_attitude_assistance_enabled,
-		"psm_max_pitch_rate": psm_max_pitch_rate,
-		"psm_max_roll_rate": psm_max_roll_rate,
-		"psm_max_yaw_rate": psm_max_yaw_rate,
-		"psm_aerodynamic_coupling_factor": psm_aerodynamic_coupling_factor,
-		"psm_direct_control_mode": psm_direct_control_mode,
-		"psm_rate_authority": psm_rate_authority
+		"psm_aerodynamic_coupling_factor": psm_aerodynamic_coupling_factor
 	}
 
 func set_control_input(input_name: String, value: float):
