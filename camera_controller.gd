@@ -16,15 +16,15 @@ enum CameraMode {
 @export_group("Chase Camera")
 @export var chase_distance: float = 15.0  # meters behind aircraft
 @export var chase_height: float = 5.0  # meters above aircraft
-@export var chase_smoothing: float = 12.0  # how smooth the camera follows (higher = less lag)
-@export var look_ahead: float = 10.0  # how far ahead to look
-@export var loose_rotation_influence: float = 0.3  # how much plane rotation affects camera (0.0-1.0)
+@export var chase_position_smoothing: float = 12.0  # how smooth position follows (higher = less lag)
+@export var chase_rotation_smoothing: float = 3.0  # how smooth rotation follows (lower = looser, higher = tighter)
+@export var look_ahead: float = 10.0  # how far ahead to look (currently unused)
 
 ## Free look settings (right-click in any mode)
 @export_group("Free Look")
 @export var free_look_sensitivity: float = 0.3  # mouse look sensitivity
 @export var free_look_pitch_limit: float = 85.0  # max pitch angle (degrees)
-@export var free_look_auto_center_speed: float = 2.0  # how fast camera returns to center when released
+@export var free_look_smooth_return_speed: float = 5.0  # how fast camera returns when released (quaternion slerp)
 
 ## Cockpit camera settings
 @export_group("Cockpit Camera")
@@ -36,6 +36,10 @@ var _free_look_yaw: float = 0.0  # horizontal rotation
 var _free_look_pitch: float = 0.0  # vertical rotation
 var _free_look_active: bool = false
 
+# Smooth rotation tracking for chase camera
+var _chase_rotation_quat: Quaternion = Quaternion.IDENTITY  # Current camera rotation
+var _previous_mode: CameraMode = CameraMode.CHASE  # Track mode changes
+
 func _ready() -> void:
 	if not target:
 		# Try to find aircraft in scene
@@ -43,6 +47,10 @@ func _ready() -> void:
 		if not target:
 			push_warning("FlightCamera: No aircraft target assigned!")
 			return
+
+	# Initialize chase rotation to current aircraft rotation
+	if target:
+		_chase_rotation_quat = target.global_transform.basis.get_rotation_quaternion()
 
 func _input(event: InputEvent) -> void:
 	# Handle right-click free look in any camera mode
@@ -64,10 +72,28 @@ func _process(delta: float) -> void:
 	if Input.is_action_just_pressed("camera_change"):
 		cycle_camera_mode()
 
-	# Auto-center free look when not active
-	if not _free_look_active:
-		_free_look_yaw = lerp(_free_look_yaw, 0.0, free_look_auto_center_speed * delta)
-		_free_look_pitch = lerp(_free_look_pitch, 0.0, free_look_auto_center_speed * delta)
+	# Detect mode changes and reset free look smoothly
+	if current_mode != _previous_mode:
+		# Mode changed - reset free look angles instantly (no unwinding)
+		_free_look_yaw = 0.0
+		_free_look_pitch = 0.0
+		_previous_mode = current_mode
+
+		# Reset chase rotation to match aircraft
+		if current_mode == CameraMode.CHASE:
+			_chase_rotation_quat = target.global_transform.basis.get_rotation_quaternion()
+
+	# Auto-center free look when not active (smooth quaternion return)
+	if not _free_look_active and (abs(_free_look_yaw) > 0.01 or abs(_free_look_pitch) > 0.01):
+		# Smooth return to center using lerp
+		_free_look_yaw = lerp(_free_look_yaw, 0.0, free_look_smooth_return_speed * delta)
+		_free_look_pitch = lerp(_free_look_pitch, 0.0, free_look_smooth_return_speed * delta)
+
+		# Snap to zero when very close to avoid endless tiny movements
+		if abs(_free_look_yaw) < 0.001:
+			_free_look_yaw = 0.0
+		if abs(_free_look_pitch) < 0.001:
+			_free_look_pitch = 0.0
 
 	# Update camera based on current mode
 	match current_mode:
@@ -81,53 +107,64 @@ func cycle_camera_mode() -> void:
 	current_mode = next_mode_int as CameraMode
 	print("Camera mode: ", CameraMode.keys()[current_mode])
 
-func update_chase_camera(_delta: float) -> void:
-	## Third-person chase camera with orbiting free look and loose plane-relative rotation
-	## - Rigid follow with fixed distance (no jitter)
-	## - Free look orbits independently (not affected by plane orientation)
-	## - Normal mode: Camera loosely rotates with plane
+func update_chase_camera(delta: float) -> void:
+	## Third-person chase camera with loose rotation following and free look
+	## - Position follows aircraft rigidly (no jitter)
+	## - Rotation smoothly follows aircraft using quaternion slerp
+	## - Free look adds offset rotation when active
 
 	var aircraft_position: Vector3 = target.global_position
+	var aircraft_basis: Basis = target.global_transform.basis
 
 	# Determine camera position: either fixed behind or orbiting with free look
 	if _free_look_active or abs(_free_look_yaw) > 0.01 or abs(_free_look_pitch) > 0.01:
-		# FREE LOOK ORBITING: Camera orbits in world space (independent of plane orientation)
-		# Offset is calculated from world center, not aircraft local space
+		# === FREE LOOK MODE ===
+		# Camera orbits in world space, independent of plane orientation
 
-		# Default back position in world space
+		# Base offset in world space (behind and above)
 		var base_offset: Vector3 = Vector3(0, 0, chase_distance) + Vector3(0, chase_height, 0)
 
-		# Apply orbit rotations in world space (not affected by plane orientation)
-		# Yaw rotation (horizontal orbit around world up axis)
+		# Apply orbit rotations in world space
 		var yaw_quat: Quaternion = Quaternion(Vector3.UP, _free_look_yaw)
-		# Pitch rotation (vertical orbit around world right axis)
 		var pitch_quat: Quaternion = Quaternion(Vector3.RIGHT, _free_look_pitch)
 
 		# Combine rotations and apply to offset
 		var orbit_offset: Vector3 = (pitch_quat * yaw_quat) * base_offset
 		global_position = aircraft_position + orbit_offset
 
-		# Always look at aircraft
+		# Look at aircraft
 		look_at(aircraft_position, Vector3.UP)
 	else:
-		# NORMAL MODE: Follow plane's rear in all 6DOF with smooth rotation only
-		# Camera position is FIXED relative to aircraft (no position smoothing to avoid jitter)
+		# === NORMAL CHASE MODE ===
+		# Loosely follow plane's rotation using quaternion slerp
 
-		# Desired position: behind and above aircraft in aircraft's local space
+		# Get target rotation (aircraft's current rotation)
+		var target_rotation_quat: Quaternion = aircraft_basis.get_rotation_quaternion()
+
+		# Smoothly interpolate camera rotation toward aircraft rotation
+		# Lower chase_rotation_smoothing = looser follow (more lag)
+		# Higher chase_rotation_smoothing = tighter follow (less lag)
+		var slerp_weight: float = clamp(chase_rotation_smoothing * delta, 0.0, 1.0)
+		_chase_rotation_quat = _chase_rotation_quat.slerp(target_rotation_quat, slerp_weight)
+
+		# Normalize to prevent drift
+		_chase_rotation_quat = _chase_rotation_quat.normalized()
+
+		# Create camera basis from smoothed rotation
+		var camera_basis: Basis = Basis(_chase_rotation_quat)
+
+		# Calculate position: behind and above aircraft in camera's smoothed local space
 		var target_pos: Vector3 = aircraft_position
-		target_pos += target.global_transform.basis.z * chase_distance  # behind
-		target_pos += target.global_transform.basis.y * chase_height  # above
+		target_pos += camera_basis.z * chase_distance  # behind (in Godot, Z is backward)
+		target_pos += camera_basis.y * chase_height    # above
 
-		# FIXED position follow (NO smoothing to maintain rigid distance)
+		# Set position (fixed, no smoothing to avoid jitter)
 		global_position = target_pos
 
-		# Desired rotation: match plane's rotation exactly
-		var target_basis: Basis = target.global_transform.basis
+		# Apply smoothed rotation
+		global_transform.basis = camera_basis
 
-		# Direct rotation follow (no smoothing - camera rotates with plane)
-		global_transform.basis = target_basis
-
-		# Always look at aircraft
+		# Look at aircraft to point camera forward
 		look_at(aircraft_position, Vector3.UP)
 
 func update_cockpit_camera(_delta: float) -> void:
